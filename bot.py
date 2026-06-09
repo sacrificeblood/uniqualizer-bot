@@ -91,13 +91,28 @@ def make_gradient_bg(size: tuple, color: tuple) -> Image.Image:
 def place_on_canvas(img: Image.Image) -> Image.Image:
     edge_color = get_edge_color(img)
     bg = make_gradient_bg((OUTPUT_W, OUTPUT_H), edge_color)
-    max_w = int(OUTPUT_W * 0.82)
-    max_h = int(OUTPUT_H * 0.82)
-    img_copy = img.copy()
-    img_copy.thumbnail((max_w, max_h), Image.LANCZOS)
-    paste_x = (OUTPUT_W - img_copy.width) // 2
-    paste_y = (OUTPUT_H - img_copy.height) // 2
-    bg.paste(img_copy, (paste_x, paste_y))
+
+    orig_w, orig_h = img.size
+    max_w = int(OUTPUT_W * 0.88)
+    max_h = int(OUTPUT_H * 0.88)
+
+    # Точный расчёт размера с сохранением пропорций
+    scale = min(max_w / orig_w, max_h / orig_h)
+
+    # Если оригинал меньше канваса — не увеличиваем (нет смысла)
+    # Если больше — уменьшаем с максимальным качеством
+    if scale < 1.0:
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        # LANCZOS — лучший фильтр для уменьшения, без артефактов
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+    else:
+        # Оригинал меньше канваса — вставляем как есть без увеличения
+        resized = img.copy()
+
+    paste_x = (OUTPUT_W - resized.width) // 2
+    paste_y = (OUTPUT_H - resized.height) // 2
+    bg.paste(resized, (paste_x, paste_y))
     return bg
 
 
@@ -161,18 +176,22 @@ def uniqualize_photo_to_zip(image_bytes: bytes, original_filename: str = "image"
     base_name = os.path.splitext(original_filename)[0]
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Канвас строим один раз из оригинала — потом применяем уникализацию
+        # Так ресайз происходит только 1 раз, уникализация идёт по готовому канвасу
+        base_canvas = place_on_canvas(original)
+
         for method_name, method_fn in PHOTO_METHODS:
             try:
-                processed = method_fn(original.copy())
-                canvas = place_on_canvas(processed)
+                # Уникализируем уже отресайзенный канвас — нет двойного пережатия
+                processed = method_fn(base_canvas.copy())
                 img_buf = io.BytesIO()
-                canvas.save(img_buf, format="JPEG", quality=95, subsampling=0)
+                processed.save(img_buf, format="JPEG", quality=97, subsampling=0, optimize=False)
                 img_buf.seek(0)
                 zf.writestr(f"{base_name}_{method_name}.jpg", img_buf.read())
             except Exception as e:
                 log.error(f"Фото ошибка {method_name}: {e}")
                 img_buf = io.BytesIO()
-                original.save(img_buf, format="JPEG", quality=95, subsampling=0)
+                base_canvas.save(img_buf, format="JPEG", quality=97, subsampling=0, optimize=False)
                 img_buf.seek(0)
                 zf.writestr(f"{base_name}_{method_name}.jpg", img_buf.read())
     zip_buf.seek(0)
