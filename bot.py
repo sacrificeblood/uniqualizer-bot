@@ -37,28 +37,36 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".f
 # ═══════════════════════════════════════════════════════════════
 
 def get_edge_color(img: Image.Image) -> tuple:
+    """
+    Точный подбор цвета фона через угловые зоны + квантизация + медиана.
+    """
     rgb = img.convert("RGB")
-    w, h = rgb.size
-    border = max(1, int(min(w, h) * 0.05))
-    pixels = []
-    for x in range(w):
-        for y in range(border):
-            pixels.append(rgb.getpixel((x, y)))
-    for x in range(w):
-        for y in range(h - border, h):
-            pixels.append(rgb.getpixel((x, y)))
-    for x in range(border):
-        for y in range(border, h - border):
-            pixels.append(rgb.getpixel((x, y)))
-    for x in range(w - border, w):
-        for y in range(border, h - border):
-            pixels.append(rgb.getpixel((x, y)))
-    if not pixels:
-        return (30, 30, 30)
-    r = int(sum(p[0] for p in pixels) / len(pixels))
-    g = int(sum(p[1] for p in pixels) / len(pixels))
-    b = int(sum(p[2] for p in pixels) / len(pixels))
-    log.info(f"Цвет края: RGB({r},{g},{b})")
+    small = rgb.copy()
+    small.thumbnail((200, 200), Image.LANCZOS)
+    w, h = small.size
+    zx = max(1, int(w * 0.22))
+    zy = max(1, int(h * 0.22))
+
+    zones = [
+        small.crop((0,    0,    zx,   zy)),
+        small.crop((w-zx, 0,    w,    zy)),
+        small.crop((0,    h-zy, zx,   h)),
+        small.crop((w-zx, h-zy, w,    h)),
+        small.crop((0,    h//2-zy//2, zx, h//2+zy//2)),
+        small.crop((w-zx, h//2-zy//2, w,  h//2+zy//2)),
+    ]
+
+    zone_colors = []
+    for zone in zones:
+        q = zone.quantize(colors=4, method=Image.Quantize.FASTOCTREE)
+        palette = q.getpalette()[:12]
+        zone_colors.append((palette[0], palette[1], palette[2]))
+
+    r = sorted([c[0] for c in zone_colors])[len(zone_colors)//2]
+    g = sorted([c[1] for c in zone_colors])[len(zone_colors)//2]
+    b = sorted([c[2] for c in zone_colors])[len(zone_colors)//2]
+
+    log.info(f"Цвет фона: RGB({r},{g},{b})")
     return (r, g, b)
 
 
@@ -276,23 +284,13 @@ def build_ffmpeg_filter(params: dict, mode: str, color: tuple = None) -> str:
     eq_filter = f"eq=brightness={b_val:.4f}:contrast={1 + c_val/100:.4f}:saturation={s_val:.4f}"
 
     if mode == "tiktok":
-        # Добавляем градиентный фон и масштабирование до 720x1280
-        r, g, b_c = color if color else (30, 30, 30)
-        dark_r = max(0, int(r * 0.35))
-        dark_g = max(0, int(g * 0.35))
-        dark_b = max(0, int(b_c * 0.35))
-        bg_color = f"{dark_r:02x}{dark_g:02x}{dark_b:02x}"
-
-        # scale видео до 82% от 720x1280, pad до 720x1280 с цветным фоном
-        scale_w = int(OUTPUT_W * 0.82)
-        scale_h = int(OUTPUT_H * 0.82)
-        pad_x   = (OUTPUT_W - scale_w) // 2
-        pad_y   = (OUTPUT_H - scale_h) // 2
-
+        # Scale + crop по центру до 720x1280 — без полей, без чёрных полос
+        # Сначала масштабируем так чтобы короткая сторона = нужному размеру
+        # Затем обрезаем длинную по центру
         vf = (
             f"{eq_filter},"
-            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=decrease,"
-            f"pad={OUTPUT_W}:{OUTPUT_H}:{pad_x}:{pad_y}:#{bg_color},"
+            f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+            f"crop={OUTPUT_W}:{OUTPUT_H},"
             f"setsar=1"
         )
     else:
