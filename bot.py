@@ -1,11 +1,9 @@
 """
 Telegram Image Uniqualizer Bot
-- Принимает фото
-- Определяет доминирующий цвет
-- Отдаляет изображение (добавляет отступы)
-- Заливает фон градиентом из доминирующего цвета
-- Создаёт 6 уникальных версий
-- Отправляет ZIP архивом
+- Размер выхода: 720x1280 (TikTok/Reels)
+- Фон определяется по краям оригинала (точнее)
+- Градиент из реального цвета фона
+- 6 уникальных JPEG 95% в ZIP
 """
 
 import os
@@ -26,107 +24,108 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 telebot.apihelper.CONNECT_TIMEOUT = 60
 telebot.apihelper.READ_TIMEOUT = 120
 
-
-# ─── ДОМИНИРУЮЩИЙ ЦВЕТ ───────────────────────────────────────────────────────
-
-def get_dominant_color(img: Image.Image) -> tuple:
-    """Определяет доминирующий цвет изображения через уменьшенную копию"""
-    small = img.copy().convert("RGB")
-    small.thumbnail((100, 100))
-    pixels = list(small.getdata())
-
-    # Убираем слишком светлые и слишком тёмные пиксели
-    filtered = [
-        p for p in pixels
-        if not (p[0] > 230 and p[1] > 230 and p[2] > 230)  # не белые
-        and not (p[0] < 25 and p[1] < 25 and p[2] < 25)    # не чёрные
-    ]
-    if not filtered:
-        filtered = pixels
-
-    avg_r = int(sum(p[0] for p in filtered) / len(filtered))
-    avg_g = int(sum(p[1] for p in filtered) / len(filtered))
-    avg_b = int(sum(p[2] for p in filtered) / len(filtered))
-    return (avg_r, avg_g, avg_b)
+OUTPUT_W = 720
+OUTPUT_H = 1280
 
 
-def darken_color(color: tuple, factor: float) -> tuple:
-    """Затемняет цвет на factor (0.0 - 1.0)"""
-    return tuple(max(0, int(c * factor)) for c in color)
+# ─── ТОЧНОЕ ОПРЕДЕЛЕНИЕ ЦВЕТА ФОНА ───────────────────────────────────────────
 
-
-def lighten_color(color: tuple, factor: float) -> tuple:
-    """Осветляет цвет"""
-    return tuple(min(255, int(c + (255 - c) * factor)) for c in color)
-
-
-def make_gradient_background(size: tuple, color: tuple) -> Image.Image:
+def get_edge_color(img: Image.Image) -> tuple:
     """
-    Создаёт градиентный фон нужного размера.
-    Центр — чуть светлее, края — темнее (радиальный эффект).
+    Берёт пиксели только с краёв изображения (5% полоса по периметру).
+    Это даёт реальный цвет фона, а не объектов в центре.
+    """
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    border = max(1, int(min(w, h) * 0.05))
+
+    pixels = []
+    # Верхняя полоса
+    for x in range(w):
+        for y in range(border):
+            pixels.append(rgb.getpixel((x, y)))
+    # Нижняя полоса
+    for x in range(w):
+        for y in range(h - border, h):
+            pixels.append(rgb.getpixel((x, y)))
+    # Левая полоса
+    for x in range(border):
+        for y in range(border, h - border):
+            pixels.append(rgb.getpixel((x, y)))
+    # Правая полоса
+    for x in range(w - border, w):
+        for y in range(border, h - border):
+            pixels.append(rgb.getpixel((x, y)))
+
+    if not pixels:
+        return (30, 30, 30)
+
+    r = int(sum(p[0] for p in pixels) / len(pixels))
+    g = int(sum(p[1] for p in pixels) / len(pixels))
+    b = int(sum(p[2] for p in pixels) / len(pixels))
+
+    log.info(f"Цвет края: RGB({r},{g},{b})")
+    return (r, g, b)
+
+
+def scale_color(color: tuple, factor: float) -> tuple:
+    return tuple(max(0, min(255, int(c * factor))) for c in color)
+
+
+def make_gradient_bg(size: tuple, color: tuple) -> Image.Image:
+    """
+    Вертикальный градиент:
+    сверху — тёмная версия цвета
+    середина — чуть светлее
+    снизу — снова тёмнее
     """
     w, h = size
     bg = Image.new("RGB", size)
     draw = ImageDraw.Draw(bg)
 
-    dark = darken_color(color, 0.35)
-    mid  = darken_color(color, 0.60)
-    light = darken_color(color, 0.80)
+    top    = scale_color(color, 0.40)
+    mid    = scale_color(color, 0.70)
+    bottom = scale_color(color, 0.30)
 
-    # Вертикальный градиент сверху вниз
     for y in range(h):
-        t = y / h
-        if t < 0.5:
-            # тёмный → средний
-            ratio = t / 0.5
-            r = int(dark[0] + (mid[0] - dark[0]) * ratio)
-            g = int(dark[1] + (mid[1] - dark[1]) * ratio)
-            b = int(dark[2] + (mid[2] - dark[2]) * ratio)
+        t = y / (h - 1)
+        if t < 0.45:
+            ratio = t / 0.45
+            r = int(top[0] + (mid[0] - top[0]) * ratio)
+            g = int(top[1] + (mid[1] - top[1]) * ratio)
+            b = int(top[2] + (mid[2] - top[2]) * ratio)
         else:
-            # средний → тёмный снизу
-            ratio = (t - 0.5) / 0.5
-            r = int(mid[0] + (dark[0] - mid[0]) * ratio)
-            g = int(mid[1] + (dark[1] - mid[1]) * ratio)
-            b = int(mid[2] + (dark[2] - mid[2]) * ratio)
-        draw.line([(0, y), (w, y)], fill=(r, g, b))
-
-    # Добавляем диагональный световой акцент (виньетка)
-    overlay = Image.new("RGBA", size, (0, 0, 0, 0))
-    draw2 = ImageDraw.Draw(overlay)
-    for i in range(min(w, h) // 2):
-        alpha = int(30 * (1 - i / (min(w, h) // 2)))
-        draw2.ellipse(
-            [w // 2 - i, h // 2 - i, w // 2 + i, h // 2 + i],
-            outline=(*light, alpha)
-        )
-    bg = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
+            ratio = (t - 0.45) / 0.55
+            r = int(mid[0] + (bottom[0] - mid[0]) * ratio)
+            g = int(mid[1] + (bottom[1] - mid[1]) * ratio)
+            b = int(mid[2] + (bottom[2] - mid[2]) * ratio)
+        draw.line([(0, y), (w - 1, y)], fill=(r, g, b))
 
     return bg
 
 
-def add_zoom_out_with_gradient(img: Image.Image, padding_pct: float = 0.12) -> Image.Image:
+def place_on_canvas(img: Image.Image) -> Image.Image:
     """
-    Отдаляет изображение: добавляет отступы padding_pct от размера,
-    заливает фон градиентом из доминирующего цвета.
+    1. Определяет цвет фона по краям
+    2. Создаёт канвас 720x1280 с градиентом
+    3. Вписывает оригинал по центру с отступами ~10%
     """
-    orig_w, orig_h = img.size
+    edge_color = get_edge_color(img)
+    bg = make_gradient_bg((OUTPUT_W, OUTPUT_H), edge_color)
 
-    pad_x = int(orig_w * padding_pct)
-    pad_y = int(orig_h * padding_pct)
+    # Зона для изображения: 80% ширины и высоты канваса
+    max_w = int(OUTPUT_W * 0.82)
+    max_h = int(OUTPUT_H * 0.82)
 
-    new_w = orig_w + pad_x * 2
-    new_h = orig_h + pad_y * 2
+    # Масштабируем оригинал вписываясь в max_w x max_h
+    img_copy = img.copy()
+    img_copy.thumbnail((max_w, max_h), Image.LANCZOS)
 
-    # Определяем цвет
-    dominant = get_dominant_color(img)
-    log.info(f"Доминирующий цвет: {dominant}")
+    # Центрируем
+    paste_x = (OUTPUT_W - img_copy.width) // 2
+    paste_y = (OUTPUT_H - img_copy.height) // 2
 
-    # Создаём фон
-    bg = make_gradient_background((new_w, new_h), dominant)
-
-    # Вставляем оригинал по центру
-    bg.paste(img, (pad_x, pad_y))
-
+    bg.paste(img_copy, (paste_x, paste_y))
     return bg
 
 
@@ -141,10 +140,10 @@ def method_1(img):
 def method_2(img):
     img = ImageEnhance.Color(img).enhance(random.uniform(0.88, 1.18))
     r, g, b = img.split()
-    shift_r = random.randint(-10, 10)
-    shift_b = random.randint(-10, 10)
-    r = r.point(lambda x: max(0, min(255, x + shift_r)))
-    b = b.point(lambda x: max(0, min(255, x + shift_b)))
+    sr = random.randint(-10, 10)
+    sb = random.randint(-10, 10)
+    r = r.point(lambda x: max(0, min(255, x + sr)))
+    b = b.point(lambda x: max(0, min(255, x + sb)))
     return Image.merge("RGB", (r, g, b))
 
 def method_3(img):
@@ -155,7 +154,7 @@ def method_3(img):
 def method_4(img):
     r, g, b = img.split()
     r = r.point(lambda x: max(0, min(255, x + random.randint(-12, 12))))
-    g = g.point(lambda x: max(0, min(255, x + random.randint(-8, 8))))
+    g = g.point(lambda x: max(0, min(255, x + random.randint(-8,  8))))
     b = b.point(lambda x: max(0, min(255, x + random.randint(-12, 12))))
     img = Image.merge("RGB", (r, g, b))
     img = ImageEnhance.Brightness(img).enhance(random.uniform(0.97, 1.04))
@@ -178,12 +177,12 @@ def method_6(img):
 
 
 METHODS = [
-    ("variant_1_brightness", method_1),
-    ("variant_2_colorshift",  method_2),
-    ("variant_3_gamma",       method_3),
-    ("variant_4_rgb",         method_4),
-    ("variant_5_sharpen",     method_5),
-    ("variant_6_combo",       method_6),
+    ("v1_brightness", method_1),
+    ("v2_colorshift",  method_2),
+    ("v3_gamma",       method_3),
+    ("v4_rgb",         method_4),
+    ("v5_sharpen",     method_5),
+    ("v6_combo",       method_6),
 ]
 
 
@@ -191,20 +190,14 @@ def uniqualize_to_zip(image_bytes: bytes, original_filename: str = "image") -> b
     original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     base_name = os.path.splitext(original_filename)[0]
 
-    # Отступ — 12% от размера (можно менять)
-    PADDING_PCT = 0.12
-
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for method_name, method_fn in METHODS:
             try:
-                # 1. Уникализируем цвет/яркость
                 processed = method_fn(original.copy())
-                # 2. Добавляем отступ с градиентным фоном
-                with_bg = add_zoom_out_with_gradient(processed, PADDING_PCT)
-                # 3. Сохраняем JPEG 95
+                canvas = place_on_canvas(processed)
                 img_buf = io.BytesIO()
-                with_bg.save(img_buf, format="JPEG", quality=95, subsampling=0)
+                canvas.save(img_buf, format="JPEG", quality=95, subsampling=0)
                 img_buf.seek(0)
                 zf.writestr(f"{base_name}_{method_name}.jpg", img_buf.read())
                 log.info(f"OK: {method_name}")
@@ -233,13 +226,10 @@ def send_with_retry(func, *args, retries=3, delay=5, **kwargs):
 
 def process_and_send(chat_id, image_bytes, filename, status_msg_id):
     try:
-        bot.edit_message_text("🎨 Определяю цвет и создаю фон...", chat_id, status_msg_id)
+        bot.edit_message_text("🎨 Анализирую цвет фона...", chat_id, status_msg_id)
         zip_bytes = uniqualize_to_zip(image_bytes, filename)
         size_kb = len(zip_bytes) / 1024
-        log.info(f"ZIP: {size_kb:.1f} KB")
-
         bot.edit_message_text(f"📦 Отправляю ZIP ({size_kb:.0f} KB)...", chat_id, status_msg_id)
-
         zip_name = os.path.splitext(filename)[0] + "_uniqualized.zip"
         send_with_retry(
             bot.send_document,
@@ -247,13 +237,12 @@ def process_and_send(chat_id, image_bytes, filename, status_msg_id):
             document=(zip_name, io.BytesIO(zip_bytes)),
             caption=(
                 "✅ <b>6 уникальных версий готовы!</b>\n"
-                "🎨 Градиентный фон под цвет креатива\n"
-                "📐 Отступы 12% со всех сторон\n"
+                "📐 Размер: 720×1280\n"
+                "🎨 Градиент подобран по краям креатива\n"
                 "🔁 Пришли следующее фото!"
             )
         )
         bot.delete_message(chat_id, status_msg_id)
-
     except Exception as e:
         log.error(f"Ошибка: {e}")
         try:
@@ -269,14 +258,12 @@ def cmd_start(message):
     bot.send_message(
         message.chat.id,
         "👋 <b>Image Uniqualizer Bot</b>\n\n"
-        "📎 Отправь фото <b>как файл</b> (скрепка → Файл) — лучшее качество\n"
+        "📎 Отправь фото <b>как файл</b> (скрепка → Файл)\n"
         "📸 Или просто фото\n\n"
-        "Что делает бот:\n"
-        "🎨 Определяет цвет креатива\n"
-        "📐 Отдаляет фото (отступы 12%)\n"
-        "🌈 Заливает фон градиентом под цвет\n"
-        "✨ Создаёт 6 уникальных версий\n"
-        "📦 Отдаёт ZIP архивом\n\n"
+        "Что делает:\n"
+        "📐 Размер выхода: <b>720×1280</b>\n"
+        "🎨 Анализирует цвет по краям → градиент\n"
+        "✨ 6 уникальных версий в ZIP\n\n"
         "⚡ Без поворотов и зеркал!"
     )
 
@@ -303,7 +290,7 @@ def handle_photo(message):
     status_msg = bot.send_message(
         chat_id,
         "⏳ Скачиваю...\n"
-        "<i>💡 Для лучшего качества отправляй как файл (скрепка → Файл)</i>"
+        "<i>💡 Для лучшего качества — отправляй как файл (скрепка → Файл)</i>"
     )
     try:
         file_id = message.photo[-1].file_id
