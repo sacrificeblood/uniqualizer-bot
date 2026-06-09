@@ -15,7 +15,6 @@ import logging
 import zipfile
 import time
 from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
-import numpy as np
 
 TOKEN = os.getenv("BOT_TOKEN", "8683713082:AAE196Xk0R5zL_8jPhN3iW6wdJcPMZVO9k4")
 
