@@ -191,18 +191,23 @@ def uniqualize_photo_to_zip(image_bytes: bytes, original_filename: str = "image"
 
         for method_name, method_fn in PHOTO_METHODS:
             try:
-                # Уникализируем уже отресайзенный канвас — нет двойного пережатия
                 processed = method_fn(base_canvas.copy())
-                img_buf = io.BytesIO()
-                processed.save(img_buf, format="PNG", compress_level=1)
-                img_buf.seek(0)
-                zf.writestr(f"{base_name}_{method_name}.png", img_buf.read())
             except Exception as e:
                 log.error(f"Фото ошибка {method_name}: {e}")
+                processed = base_canvas.copy()
+
+            img_buf = io.BytesIO()
+            # Сохраняем JPEG с максимальным качеством, при необходимости снижаем
+            for quality in [97, 93, 88, 82]:
                 img_buf = io.BytesIO()
-                base_canvas.save(img_buf, format="PNG", compress_level=1)
-                img_buf.seek(0)
-                zf.writestr(f"{base_name}_{method_name}.png", img_buf.read())
+                processed.save(img_buf, format="JPEG", quality=quality,
+                               subsampling=0, optimize=False)
+                size_mb = img_buf.tell() / 1024 / 1024
+                if size_mb < 8:  # каждый файл внутри ZIP не более 8MB
+                    break
+                log.info(f"Файл {size_mb:.1f}MB, снижаю quality до следующего уровня")
+            img_buf.seek(0)
+            zf.writestr(f"{base_name}_{method_name}.jpg", img_buf.read())
     zip_buf.seek(0)
     return zip_buf.read()
 
@@ -308,9 +313,11 @@ def process_video(input_path: str, output_path: str, params: dict, mode: str, co
         "-vf", vf,
         "-c:v", "libx264",
         "-preset", "fast",
-        "-crf", "23",
+        "-crf", "28",          # выше = меньше размер, 28 хорошее качество
+        "-maxrate", "2M",      # максимальный битрейт 2 Мбит/с
+        "-bufsize", "4M",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
         "-movflags", "+faststart",
         output_path
     ]
@@ -340,18 +347,17 @@ def uniqualize_video_to_zip(
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_STORED) as zf:
             for i, (variant_name, params) in enumerate(VIDEO_VARIANTS, 1):
-                for mode in ["original", "tiktok"]:
-                    out_name = f"{base_name}_{variant_name}_{mode}.mp4"
-                    out_path = os.path.join(tmpdir, out_name)
-                    try:
-                        if status_callback:
-                            status_callback(f"⚙️ Версия {i}/6 ({mode})...")
-                        process_video(input_path, out_path, params, mode, color)
-                        with open(out_path, "rb") as f:
-                            zf.writestr(out_name, f.read())
-                        log.info(f"OK: {out_name}")
-                    except Exception as e:
-                        log.error(f"Ошибка {out_name}: {e}")
+                out_name = f"{base_name}_{variant_name}.mp4"
+                out_path = os.path.join(tmpdir, out_name)
+                try:
+                    if status_callback:
+                        status_callback(f"⚙️ Версия {i}/6...")
+                    process_video(input_path, out_path, params, "tiktok", color)
+                    with open(out_path, "rb") as f:
+                        zf.writestr(out_name, f.read())
+                    log.info(f"OK: {out_name}")
+                except Exception as e:
+                    log.error(f"Ошибка {out_name}: {e}")
 
         zip_buf.seek(0)
         return zip_buf.read()
@@ -387,7 +393,7 @@ def process_photo_and_send(chat_id, image_bytes, filename, status_msg_id):
                 "✅ <b>6 фото готовы!</b>\n"
                 "📐 Размер: 720×1280\n"
                 "🎨 Градиент по краям\n"
-                "🖼 Формат: PNG без потерь\n"
+                "🖼 Формат: JPEG максимальное качество\n"
                 "🔁 Пришли следующее!"
             )
         )
@@ -421,20 +427,39 @@ def process_video_and_send(chat_id, video_bytes, filename, status_msg_id):
         zip_bytes = uniqualize_video_to_zip(video_bytes, filename, status_cb)
         size_mb = len(zip_bytes) / 1024 / 1024
 
-        bot.edit_message_text(f"📦 Отправляю ZIP ({size_mb:.1f} MB)...", chat_id, status_msg_id)
-
-        zip_name = os.path.splitext(filename)[0] + "_videos.zip"
-        send_with_retry(
-            bot.send_document, chat_id,
-            document=(zip_name, io.BytesIO(zip_bytes)),
-            caption=(
-                "✅ <b>12 видео готовы!</b>\n"
-                "📁 6 версий × 2 размера:\n"
-                "• <code>_original</code> — оригинальный размер\n"
-                "• <code>_tiktok</code> — 720×1280 с градиентом\n"
-                "🔁 Пришли следующее!"
+        # Если ZIP меньше 45MB — отправляем одним архивом
+        if size_mb < 45:
+            bot.edit_message_text(f"📦 Отправляю ZIP ({size_mb:.1f} MB)...", chat_id, status_msg_id)
+            zip_name = os.path.splitext(filename)[0] + "_videos.zip"
+            send_with_retry(
+                bot.send_document, chat_id,
+                document=(zip_name, io.BytesIO(zip_bytes)),
+                caption=(
+                    "✅ <b>6 видео готовы!</b>\n"
+                    "📐 720×1280 TikTok формат\n"
+                    "🔁 Пришли следующее!"
+                )
             )
-        )
+        else:
+            # ZIP слишком большой — отправляем файлы по одному из zip
+            bot.edit_message_text(f"📤 ZIP {size_mb:.1f}MB — отправляю файлы по одному...", chat_id, status_msg_id)
+            import zipfile as zf_mod
+            zf_read = zf_mod.ZipFile(io.BytesIO(zip_bytes))
+            names = zf_read.namelist()
+            for i, name in enumerate(names, 1):
+                try:
+                    bot.edit_message_text(f"📤 Отправляю {i}/{len(names)}: {name}...", chat_id, status_msg_id)
+                    file_bytes = zf_read.read(name)
+                    send_with_retry(
+                        bot.send_document, chat_id,
+                        document=(name, io.BytesIO(file_bytes)),
+                        caption=f"#{i} {name}" if i == 1 else None
+                    )
+                    time.sleep(0.5)
+                except Exception as e:
+                    log.error(f"Ошибка отправки {name}: {e}")
+            bot.send_message(chat_id, "✅ <b>Все видео отправлены!</b>\n🔁 Пришли следующее!")
+
         bot.delete_message(chat_id, status_msg_id)
 
     except Exception as e:
